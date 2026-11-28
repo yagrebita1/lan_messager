@@ -8,6 +8,20 @@ BROADCAST_INTERVAL = 3.0   # Envoie une annonce toutes les 3 secondes
 PEER_TIMEOUT = 10.0        # Considère un pair hors ligne après 10 secondes sans signal
 
 
+def _get_broadcast_addresses() -> list:
+    """Retourne toutes les adresses de broadcast locales (sous-réseaux actifs + 255.255.255.255)."""
+    addresses = {"255.255.255.255"}
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith("127."):
+                parts = ip.split(".")
+                addresses.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+    except Exception:
+        pass
+    return list(addresses)
+
+
 class PeerDiscovery:
     """Service de découverte décentralisée des pairs sur le réseau local via UDP Broadcast."""
 
@@ -23,7 +37,7 @@ class PeerDiscovery:
         self.udp_port = udp_port
         self.on_peers_updated = on_peers_updated
 
-        # Format interne : {"Pseudo": {"ip": "192.168.x.x", "tcp_port": 5000, "last_seen": timestamp}}
+        # Format interne : {"Pseudo": {"ip": "192.168.x.x", "tcp_port": 55000, "last_seen": timestamp}}
         self._peers = {}
         self._lock = threading.Lock()
         self._running = False
@@ -57,11 +71,12 @@ class PeerDiscovery:
         if not self._running:
             return
         self._running = False
-        try:
-            bye_msg = json.dumps({"type": "BYE", "username": self.username}).encode("utf-8")
-            self._send_sock.sendto(bye_msg, ("255.255.255.255", self.udp_port))
-        except OSError:
-            pass
+        bye_msg = json.dumps({"type": "BYE", "username": self.username}).encode("utf-8")
+        for bcast_ip in _get_broadcast_addresses():
+            try:
+                self._send_sock.sendto(bye_msg, (bcast_ip, self.udp_port))
+            except OSError:
+                pass
 
         for sock in (self._send_sock, self._recv_sock):
             if sock:
@@ -80,7 +95,7 @@ class PeerDiscovery:
             self.on_peers_updated(self.get_online_peers())
 
     def _broadcast_loop(self) -> None:
-        """Annonce périodiquement sa présence à tout le sous-réseau local."""
+        """Annonce périodiquement sa présence à tous les sous-réseaux locaux."""
         hello_payload = json.dumps(
             {
                 "type": "HELLO",
@@ -90,10 +105,11 @@ class PeerDiscovery:
         ).encode("utf-8")
 
         while self._running:
-            try:
-                self._send_sock.sendto(hello_payload, ("255.255.255.255", self.udp_port))
-            except OSError:
-                pass
+            for bcast_ip in _get_broadcast_addresses():
+                try:
+                    self._send_sock.sendto(hello_payload, (bcast_ip, self.udp_port))
+                except OSError:
+                    pass
             time.sleep(BROADCAST_INTERVAL)
 
     def _listen_loop(self) -> None:
@@ -117,7 +133,7 @@ class PeerDiscovery:
                         is_new = peer_name not in self._peers or self._peers[peer_name]["ip"] != sender_ip
                         self._peers[peer_name] = {
                             "ip": sender_ip,
-                            "tcp_port": msg.get("tcp_port", 5000),
+                            "tcp_port": msg.get("tcp_port", 55000),
                             "last_seen": time.time(),
                         }
                         if is_new:

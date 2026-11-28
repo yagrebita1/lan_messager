@@ -3,7 +3,7 @@ import socket
 import threading
 import time
 
-DISCOVERY_PORT = 5001
+DISCOVERY_PORT = 55001
 BROADCAST_INTERVAL = 3.0   # Envoie une annonce toutes les 3 secondes
 PEER_TIMEOUT = 10.0        # Considère un pair hors ligne après 10 secondes sans signal
 
@@ -14,7 +14,7 @@ class PeerDiscovery:
     def __init__(
         self,
         username: str,
-        tcp_port: int = 5000,
+        tcp_port: int = 55000,
         udp_port: int = DISCOVERY_PORT,
         on_peers_updated=None,
     ):

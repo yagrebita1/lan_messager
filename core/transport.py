@@ -13,7 +13,7 @@ from core.crypto_utils import (
 
 HEADER_SIZE = 4          # 4 octets Big-Endian (>I) pour la taille de chaque trame
 CHUNK_SIZE = 65536       # Blocs de 64 Ko pour le transfert de fichiers
-DEFAULT_TCP_PORT = 5000
+DEFAULT_TCP_PORT = 55000
 
 
 def _recv_exact(sock: socket.socket, num_bytes: int) -> bytes:

@@ -1,360 +1,289 @@
-"""
-Module : core/transport.py
-Description : Gestion des communications réseau fiables (TCP) pour la messagerie décentralisée.
-Rôle : Écoute les connexions entrantes (serveur) et transmet les messages/fichiers (client).
-"""
+import os
+import json
+import socket
+import struct
+import threading
+import time
+from core.crypto_utils import (
+    compute_sha256_file,
+    verify_file_integrity,
+    encrypt_payload,
+    decrypt_payload,
+)
 
-import socket       # Fournit l'interface système pour créer des sockets réseau (TCP/UDP)
-import threading    # Permet d'exécuter plusieurs tâches en parallèle (ex: écouter sans bloquer)
-import json         # Permet de sérialiser les dictionnaires Python en chaînes de texte structurées
-import struct       # Permet d'empaqueter la taille des données en octets binaires fixes (Framing)
-import os           # Permet d'interagir avec le système de fichiers (taille, lecture par blocs)
-
-# =====================================================================
-# FONCTIONS UTILITAIRES : ENVOI ET RÉCEPTION STRUCTURÉS (FRAMING TCP)
-# =====================================================================
-
-def send_payload(sock: socket.socket, data_bytes: bytes) -> None:
-    """
-    Envoie des données sur un socket TCP en les préfixant par leur taille sur 4 octets.
-    
-    Format du paquet envoyé :
-    [ 4 octets : longueur N (format binaire réseau Big-Endian) ] + [ N octets : données ]
-    """
-    # 1. On calcule la taille totale des données en octets
-    payload_length = len(data_bytes)
-    
-    # 2. 'struct.pack(">I", payload_length)' convertit cet entier en exactement 4 octets.
-    #    '>' signifie Big-Endian (norme standard réseau).
-    #    'I' signifie unsigned int (entier non signé sur 4 octets, jusqu'à 4 Go).
-    header = struct.pack(">I", payload_length)
-    
-    # 3. 'sendall' s'assure que la totalité des octets (en-tête + données) est transmise
-    sock.sendall(header + data_bytes)
+HEADER_SIZE = 4          # 4 octets Big-Endian (>I) pour la taille de chaque trame
+CHUNK_SIZE = 65536       # Blocs de 64 Ko pour le transfert de fichiers
+DEFAULT_TCP_PORT = 5000
 
 
-def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
-    """
-    Lit précisément 'num_bytes' octets depuis le socket TCP.
-    
-    Pourquoi cette fonction est nécessaire ?
-    En TCP, 'sock.recv(N)' peut renvoyer MOINS de N octets si le réseau est lent.
-    Cette fonction boucle jusqu'à avoir récupéré l'intégralité des octets demandés.
-    """
+def _recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
+    """Lit exactement num_bytes depuis le socket TCP (gère la fragmentation réseau)."""
     buffer = bytearray()
-    
     while len(buffer) < num_bytes:
-        # On calcule combien d'octets il nous manque encore
-        remaining = num_bytes - len(buffer)
-        
-        # On lit un bloc disponible sur le réseau
-        chunk = sock.recv(remaining)
-        
-        # Si chunk est vide, l'autre machine a coupé la connexion brutalement
-        if not chunk:
-            raise ConnectionError("La connexion a été fermée par le pair distant.")
-            
-        buffer.extend(chunk)
-        
+        packet = sock.recv(num_bytes - len(buffer))
+        if not packet:
+            raise ConnectionError("Connexion fermée prématurément par le pair.")
+        buffer.extend(packet)
     return bytes(buffer)
 
-# =====================================================================
-# CLASSE SERVEUR : ÉCOUTE ET RÉCEPTION DES MESSAGES EN ARRIÈRE-PLAN
-# =====================================================================
+
+def send_frame(sock: socket.socket, raw_data: bytes, encrypt: bool = True) -> None:
+    """Encapsule les données avec un en-tête de 4 octets Big-Endian et les envoie."""
+    payload = encrypt_payload(raw_data) if encrypt else raw_data
+    header = struct.pack(">I", len(payload))
+    sock.sendall(header + payload)
+
+
+def recv_frame(sock: socket.socket, decrypt: bool = True) -> bytes:
+    """Lit l'en-tête de 4 octets puis extrait exactement la trame complète."""
+    header = _recv_exact(sock, HEADER_SIZE)
+    (payload_length,) = struct.unpack(">I", header)
+    payload = _recv_exact(sock, payload_length)
+    return decrypt_payload(payload) if decrypt else payload
+
 
 class TransportServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 5000, on_message_received=None):
-        """
-        Initialise le serveur de transport TCP.
-        
-        :param host: L'adresse d'écoute ("0.0.0.0" signifie écouter sur toutes les interfaces réseau).
-        :param port: Le port TCP réservé pour la messagerie (par défaut 5000).
-        :param on_message_received: Une fonction de rappel (callback) appelée quand un message arrive.
-        """
+    """Serveur TCP multi-clients écoutant les messages instantanés et les fichiers entrants."""
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = DEFAULT_TCP_PORT,
+        download_dir: str = "downloads",
+        on_message_received=None,
+        on_file_progress=None,
+        on_file_received=None,
+    ):
         self.host = host
         self.port = port
+        self.download_dir = download_dir
         self.on_message_received = on_message_received
-        
-        # Drapeau pour savoir si le serveur doit continuer à tourner ou s'arrêter proprement
-        self.is_running = False
-        
-        # Le socket principal du serveur
-        self.server_socket = None
-        
-        # Le thread qui gérera l'écoute sans bloquer le reste de l'application
-        self.listen_thread = None
+        self.on_file_progress = on_file_progress
+        self.on_file_received = on_file_received
 
-    def start(self):
-        """Démarre le serveur dans un thread en arrière-plan."""
-        self.is_running = True
-        
-        # 1. Création du socket : IPv4 (AF_INET) et protocole TCP (SOCK_STREAM)
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # 2. Option de réutilisation d'adresse : permet de relancer le serveur immédiatement sans attendre
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # 3. Association du socket à l'adresse IP et au port choisis
-        self.server_socket.bind((self.host, self.port))
-        
-        # 4. Activation du mode écoute (file d'attente maximale de 5 connexions simultanées)
-        self.server_socket.listen(5)
-        
-        # 5. Démarrage de la boucle d'écoute dans un thread indépendant
-        self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self.listen_thread.start()
-        print(f"[SERVEUR] En écoute sur le port {self.port}...")
+        os.makedirs(self.download_dir, exist_ok=True)
+        self._server_socket = None
+        self._running = False
+        self._thread = None
 
-    def _listen_loop(self):
-        """Boucle infinie qui attend et accepte chaque connexion entrante."""
-        while self.is_running:
+    def start(self) -> None:
+        """Démarre l'écoute TCP en arrière-plan (thread daemon)."""
+        if self._running:
+            return
+        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_socket.bind((self.host, self.port))
+        self._server_socket.listen(10)
+        self._running = True
+
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        print(f"[TransportServer] En écoute sur {self.host}:{self.port}")
+
+    def stop(self) -> None:
+        """Arrête proprement le serveur TCP."""
+        self._running = False
+        if self._server_socket:
             try:
-                # 'accept()' est bloquant : il attend qu'un pair se connecte
-                client_sock, client_addr = self.server_socket.accept()
-                
-                # Pour chaque ami qui se connecte, on lance un thread dédié pour traiter son message
-                client_handler = threading.Thread(
-                    target=self._handle_client, 
-                    args=(client_sock, client_addr), 
-                    daemon=True
-                )
-                client_handler.start()
-                
+                self._server_socket.close()
             except OSError:
-                # Se produit normalement lorsque le serveur est arrêté (fermeture du socket)
+                pass
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                client_sock, addr = self._server_socket.accept()
+                threading.Thread(
+                    target=self._handle_client,
+                    args=(client_sock, addr[0]),
+                    daemon=True,
+                ).start()
+            except OSError:
                 break
 
-    def _handle_client(self, client_sock: socket.socket, client_addr: tuple):
-        """Prend en charge la réception du message d'un pair précis."""
-        ip, port = client_addr
+    def _handle_client(self, client_sock: socket.socket, sender_ip: str) -> None:
         try:
-            # 1. On lit d'abord les 4 premiers octets pour connaître la taille du message
-            raw_header = recv_exact(client_sock, 4)
-            payload_length = struct.unpack(">I", raw_header)[0]
-            
-            # 2. On lit le nombre exact d'octets annoncé par l'en-tête
-            raw_data = recv_exact(client_sock, payload_length)
-            
-            # 3. On décode les octets reçus (texte JSON encodé en UTF-8)
-            message_text = raw_data.decode("utf-8")
-            message_dict = json.loads(message_text)
-            
-            # 4. Si une fonction de traitement a été fournie, on lui passe le message et l'IP de l'expéditeur
-            if self.on_message_received:
-                self.on_message_received(message_dict, ip)
-            else:
-                # Affichage par défaut dans le terminal pour nos tests
-                print(f"[REÇU de {ip}]: {message_dict}")
-                
+            with client_sock:
+                # 1. Lecture de la trame d'en-tête JSON (métadonnées du message ou du fichier)
+                meta_bytes = recv_frame(client_sock)
+                meta = json.loads(meta_bytes.decode("utf-8"))
+                msg_type = meta.get("type")
+
+                if msg_type == "chat_message":
+                    if self.on_message_received:
+                        self.on_message_received(meta, sender_ip)
+                    else:
+                        print(f"\n[{meta.get('sender', sender_ip)}] : {meta.get('content')}")
+
+                elif msg_type == "file_transfer":
+                    self._receive_file_stream(client_sock, meta, sender_ip)
+
         except Exception as e:
-            print(f"[ERREUR] Échec de réception depuis {ip}: {e}")
-        finally:
-            # Toujours fermer la connexion avec ce client une fois le message traité
-            client_sock.close()
+            print(f"[TransportServer] Erreur avec {sender_ip} : {e}")
 
-    def stop(self):
-        """Arrête proprement le serveur."""
-        self.is_running = False
-        if self.server_socket:
-            self.server_socket.close()
-        print("[SERVEUR] Serveur arrêté.")
-# =====================================================================
-# CLASSE SERVEUR : ÉCOUTE ET RÉCEPTION DES MESSAGES EN ARRIÈRE-PLAN
-# =====================================================================
+    def _receive_file_stream(
+        self, client_sock: socket.socket, meta: dict, sender_ip: str
+    ) -> None:
+        """Reçoit un fichier bloc par bloc et valide son empreinte SHA-256."""
+        sender = meta.get("sender", sender_ip)
+        filename = os.path.basename(meta.get("filename", "fichier_recu.bin"))
+        file_size = int(meta.get("file_size", 0))
+        expected_sha256 = meta.get("sha256", "")
 
-class TransportServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 5000, on_message_received=None):
-        """
-        Initialise le serveur de transport TCP.
-        
-        :param host: L'adresse d'écoute ("0.0.0.0" signifie écouter sur toutes les interfaces réseau).
-        :param port: Le port TCP réservé pour la messagerie (par défaut 5000).
-        :param on_message_received: Une fonction de rappel (callback) appelée quand un message arrive.
-        """
-        self.host = host
-        self.port = port
-        self.on_message_received = on_message_received
-        
-        # Drapeau pour savoir si le serveur doit continuer à tourner ou s'arrêter proprement
-        self.is_running = False
-        
-        # Le socket principal du serveur
-        self.server_socket = None
-        
-        # Le thread qui gérera l'écoute sans bloquer le reste de l'application
-        self.listen_thread = None
+        save_path = os.path.join(self.download_dir, filename)
+        # Évite d'écraser un fichier existant portant le même nom
+        if os.path.exists(save_path):
+            base, ext = os.path.splitext(filename)
+            save_path = os.path.join(self.download_dir, f"{base}_{int(time.time())}{ext}")
 
-    def start(self):
-        """Démarre le serveur dans un thread en arrière-plan."""
-        self.is_running = True
-        
-        # 1. Création du socket : IPv4 (AF_INET) et protocole TCP (SOCK_STREAM)
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        # 2. Option de réutilisation d'adresse : permet de relancer le serveur immédiatement sans attendre
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        # 3. Association du socket à l'adresse IP et au port choisis
-        self.server_socket.bind((self.host, self.port))
-        
-        # 4. Activation du mode écoute (file d'attente maximale de 5 connexions simultanées)
-        self.server_socket.listen(5)
-        
-        # 5. Démarrage de la boucle d'écoute dans un thread indépendant
-        self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self.listen_thread.start()
-        print(f"[SERVEUR] En écoute sur le port {self.port}...")
+        received_bytes = 0
+        with open(save_path, "wb") as f:
+            while received_bytes < file_size:
+                chunk = recv_frame(client_sock)
+                if not chunk:
+                    break
+                f.write(chunk)
+                received_bytes += len(chunk)
 
-    def _listen_loop(self):
-        """Boucle infinie qui attend et accepte chaque connexion entrante."""
-        while self.is_running:
-            try:
-                # 'accept()' est bloquant : il attend qu'un pair se connecte
-                client_sock, client_addr = self.server_socket.accept()
-                
-                # Pour chaque ami qui se connecte, on lance un thread dédié pour traiter son message
-                client_handler = threading.Thread(
-                    target=self._handle_client, 
-                    args=(client_sock, client_addr), 
-                    daemon=True
-                )
-                client_handler.start()
-                
-            except OSError:
-                # Se produit normalement lorsque le serveur est arrêté (fermeture du socket)
-                break
+                if self.on_file_progress and file_size > 0:
+                    progress = min(1.0, received_bytes / file_size)
+                    self.on_file_progress(sender, filename, progress)
 
-    def _handle_client(self, client_sock: socket.socket, client_addr: tuple):
-        """Prend en charge la réception du message d'un pair précis."""
-        ip, port = client_addr
-        try:
-            # 1. On lit d'abord les 4 premiers octets pour connaître la taille du message
-            raw_header = recv_exact(client_sock, 4)
-            payload_length = struct.unpack(">I", raw_header)[0]
-            
-            # 2. On lit le nombre exact d'octets annoncé par l'en-tête
-            raw_data = recv_exact(client_sock, payload_length)
-            
-            # 3. On décode les octets reçus (texte JSON encodé en UTF-8)
-            message_text = raw_data.decode("utf-8")
-            message_dict = json.loads(message_text)
-            
-            # 4. Si une fonction de traitement a été fournie, on lui passe le message et l'IP de l'expéditeur
-            if self.on_message_received:
-                self.on_message_received(message_dict, ip)
-            else:
-                # Affichage par défaut dans le terminal pour nos tests
-                print(f"[REÇU de {ip}]: {message_dict}")
-                
-        except Exception as e:
-            print(f"[ERREUR] Échec de réception depuis {ip}: {e}")
-        finally:
-            # Toujours fermer la connexion avec ce client une fois le message traité
-            client_sock.close()
+        # Contrôle final d'intégrité SHA-256
+        verified = verify_file_integrity(save_path, expected_sha256)
 
-    def stop(self):
-        """Arrête proprement le serveur."""
-        self.is_running = False
-        if self.server_socket:
-            self.server_socket.close()
-        print("[SERVEUR] Serveur arrêté.")
-# =====================================================================
-# CLASSE CLIENT : CONNEXION ET ENVOI DE MESSAGES À UN AUTRE PAIR
-# =====================================================================
+        if self.on_file_received:
+            self.on_file_received(
+                sender=sender,
+                sender_ip=sender_ip,
+                filename=filename,
+                save_path=save_path,
+                file_size=file_size,
+                verified=verified,
+            )
+        else:
+            status = "VÉRIFIÉ SHA-256" if verified else "CORROMPU (SHA-256 invalide)"
+            print(f"\n[Fichier reçu de {sender}] {filename} ({file_size} octets) -> {status}")
+
 
 class TransportClient:
-    def __init__(self, default_port: int = 5000, timeout: float = 5.0):
-        """
-        Initialise le client d'envoi TCP.
-        
-        :param default_port: Port TCP cible où écoute l'autre machine (5000 par défaut).
-        :param timeout: Temps d'attente maximum en secondes avant d'abandonner si la machine ne répond pas.
-        """
-        self.default_port = default_port
-        self.timeout = timeout
+    """Client TCP chargé d'envoyer des messages et des fichiers découpés en blocs."""
 
-    def send_message(self, target_ip: str, message_payload: dict, target_port: int = None) -> bool:
-        """
-        Établit une connexion TCP vers un pair distant et lui expédie un dictionnaire de données.
-        
-        :param target_ip: Adresse IP du pair destinataire (ex: "192.168.1.45" ou "127.0.0.1").
-        :param message_payload: Données du message sous forme de dictionnaire Python.
-        :param target_port: Port d'écoute du pair (utilise default_port si non spécifié).
-        :return: True si l'envoi a réussi, False en cas d'erreur de communication.
-        """
-        port = target_port or self.default_port
-        
-        # 1. On transforme le dictionnaire Python en texte JSON, puis en octets binaires UTF-8
-        json_string = json.dumps(message_payload)
-        data_bytes = json_string.encode("utf-8")
-        
-        # 2. Utilisation d'un bloc 'with' pour s'assurer que le socket sera toujours fermé proprement
+    def __init__(self, sender_name: str = "yagrebita", port: int = DEFAULT_TCP_PORT):
+        self.sender_name = sender_name
+        self.port = port
+
+    def send_message(self, target_ip: str, content: str, recipient: str = "") -> bool:
+        """Envoie un message texte instantané à l'adresse IP cible."""
+        payload = {
+            "type": "chat_message",
+            "sender": self.sender_name,
+            "recipient": recipient,
+            "content": content,
+            "timestamp": time.time(),
+        }
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                # Définit un délai limite pour ne pas figer l'application si l'IP cible n'existe pas
-                sock.settimeout(self.timeout)
-                
-                # Établissement de la poignée de main TCP (3-Way Handshake : SYN, SYN-ACK, ACK)
-                sock.connect((target_ip, port))
-                
-                # Envoi des données préfixées par les 4 octets de taille via notre fonction utilitaire
-                send_payload(sock, data_bytes)
-                
-                print(f"[CLIENT] Message envoyé avec succès à {target_ip}:{port}")
-                return True
-                
-        except socket.timeout:
-            print(f"[CLIENT ERREUR] Délai d'attente dépassé pour se connecter à {target_ip}:{port}")
-            return False
-        except ConnectionRefusedError:
-            print(f"[CLIENT ERREUR] Connexion refusée par {target_ip}:{port} (le pair est injoignable ou le serveur n'est pas lancé)")
-            return False
+            with socket.create_connection((target_ip, self.port), timeout=5.0) as sock:
+                send_frame(sock, json.dumps(payload).encode("utf-8"))
+            return True
         except Exception as e:
-            print(f"[CLIENT ERREUR] Échec d'envoi vers {target_ip}:{port} -> {e}")
+            print(f"[TransportClient] Échec d'envoi du message vers {target_ip} : {e}")
             return False
-# =====================================================================
-# BANC D'ESSAI INTERACTIF : SÉPARATION SERVEUR / CLIENT SUR 2 TERMINAUX
-# =====================================================================
 
-if __name__ == "__main__":
-    import time
-    import sys
+    def send_file(
+        self,
+        target_ip: str,
+        file_path: str,
+        recipient: str = "",
+        on_progress=None,
+    ) -> dict:
+        """
+        Découpe un fichier en blocs de 64 Ko, calcule son SHA-256 et l'envoie via TCP.
+        Retourne un dictionnaire avec le statut et l'empreinte SHA-256.
+        """
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Fichier introuvable : {file_path}")
 
-    print("=== TEST MANUEL MULTI-TERMINAL (core/transport.py) ===")
-    print("1. Lancer comme SERVEUR (Écouteur)")
-    print("2. Lancer comme CLIENT (Émetteur)")
-    choix = input("Choisissez le rôle (1 ou 2) : ").strip()
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        sha256_hash = compute_sha256_file(file_path)
 
-    if choix == "1":
-        # RÔLE DU SERVEUR : reste allumé et écoute en continu
-        server = TransportServer(host="0.0.0.0", port=5000)
-        server.start()
-        print("\n[SERVEUR PRÊT] En attente de messages... (Appuyez sur Ctrl+C pour arrêter)")
+        meta = {
+            "type": "file_transfer",
+            "sender": self.sender_name,
+            "recipient": recipient,
+            "filename": filename,
+            "file_size": file_size,
+            "sha256": sha256_hash,
+            "timestamp": time.time(),
+        }
+
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            server.stop()
-            print("\n[SERVEUR] Arrêt demandé.")
+            with socket.create_connection((target_ip, self.port), timeout=10.0) as sock:
+                # 1. Envoi des métadonnées + empreinte SHA-256
+                send_frame(sock, json.dumps(meta).encode("utf-8"))
 
-    elif choix == "2":
-        # RÔLE DU CLIENT : demande un message et l'expédie
-        client = TransportClient(default_port=5000)
-        ip_cible = input("Entrez l'IP du serveur (appuyez sur Entrée pour 127.0.0.1) : ").strip() or "127.0.0.1"
-        
-        while True:
-            texte = input("\nVotre message (ou 'exit' pour quitter) : ").strip()
-            if texte.lower() == "exit":
-                break
-            
-            paquet = {
-                "type": "chat_message",
-                "sender": "yagrebita",
-                "content": texte,
-                "timestamp": time.time()
+                # 2. Envoi du fichier bloc par bloc (64 Ko)
+                sent_bytes = 0
+                with open(file_path, "rb") as f:
+                    while True:
+                        chunk = f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        send_frame(sock, chunk)
+                        sent_bytes += len(chunk)
+
+                        if on_progress and file_size > 0:
+                            on_progress(min(1.0, sent_bytes / file_size))
+
+            return {
+                "success": True,
+                "filename": filename,
+                "file_size": file_size,
+                "sha256": sha256_hash,
             }
-            client.send_message(ip_cible, paquet)
-            
-        print("[CLIENT] Déconnexion.")
-    else:
-        print("[ERREUR] Choix invalide. Tapez 1 ou 2.")
+        except Exception as e:
+            print(f"[TransportClient] Échec du transfert de fichier vers {target_ip} : {e}")
+            return {"success": False, "error": str(e)}
+
+
+# ==========================================================
+# MODE TEST INTERACTIF (Messages + Fichiers sur 2 PC ou local)
+# ==========================================================
+if __name__ == "__main__":
+    print("=== TEST MOTEUR TRANSPORT TCP + SHA-256 ===")
+    pseudo = input("Votre pseudo (ex: yagrebita) : ").strip() or "yagrebita"
+    port = int(input("Port d'écoute (défaut 5000) : ").strip() or "5000")
+
+    server = TransportServer(port=port)
+    server.start()
+
+    client = TransportClient(sender_name=pseudo, port=port)
+    print("\nCommandes disponibles :")
+    print("  1. Envoyer un message texte")
+    print("  2. Envoyer un fichier (avec vérification SHA-256)")
+    print("  3. Quitter\n")
+
+    try:
+        while True:
+            choix = input("Choix (1/2/3) > ").strip()
+            if choix == "1":
+                ip = input("IP destinataire (ex: 127.0.0.1) : ").strip() or "127.0.0.1"
+                msg = input("Message : ")
+                if client.send_message(ip, msg):
+                    print("✔ Message envoyé.")
+            elif choix == "2":
+                ip = input("IP destinataire (ex: 127.0.0.1) : ").strip() or "127.0.0.1"
+                chemin = input("Chemin du fichier (ex: maquette.jpg) : ").strip()
+                res = client.send_file(
+                    ip,
+                    chemin,
+                    on_progress=lambda p: print(f"\rProgression : {int(p * 100)}%", end=""),
+                )
+                print()
+                if res.get("success"):
+                    print(f"✔ Fichier envoyé ! SHA-256 : {res['sha256']}")
+            elif choix == "3":
+                break
+    finally:
+        server.stop()

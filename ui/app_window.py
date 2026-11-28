@@ -28,33 +28,30 @@ class AppWindow(ctk.CTk):
         self.minsize(880, 540)
         self.configure(fg_color="#FFFFFF")
 
-        # Données simulées (remplacées par core/discovery.py à l'intégration)
-        self.peers = {
-            "Grégoire (Vous)": {"ip": "127.0.0.1", "online": True},
-            "Marc": {"ip": "192.168.1.15", "online": True},
-            "Sophie": {"ip": "192.168.1.22", "online": True},
-            "Alex": {"ip": "192.168.1.30", "online": True},
-        }
-        self.active_peer = "Marc"
-        self.chat_history = {name: [] for name in self.peers}
+        # État initial vide (alimenté dynamiquement par core/discovery.py)
+        self.peers = {}  # Format attendu : {"Pseudo": {"ip": "192.168.x.x", "online": True}}
+        self.active_peer = None
+        self.chat_history = {}
         self.peer_buttons = {}
 
-        # Grille principale : 2 colonnes (Sidebar 260px + Zone Chat extensible)
-        self.grid_columnconfigure(0, weight=0, minsize=260)
+        # Grille principale : Sidebar fixe (270px) + Zone de discussion extensible
+        self.grid_columnconfigure(0, weight=0, minsize=270)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         self._build_sidebar()
         self._build_chat_area()
-        self._load_demo_conversation()
-        self.select_peer("Marc")
+
+        # Affichage initial des états vides
+        self._refresh_peer_list()
+        self._render_empty_chat_state()
 
     # ==========================================================
     # COLONNE DE GAUCHE : SIDEBAR CONTACTS & PROFIL
     # ==========================================================
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(
-            self, width=260, corner_radius=0, fg_color="#F8FAFC"
+            self, width=270, corner_radius=0, fg_color="#F8FAFC"
         )
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_propagate(False)
@@ -77,7 +74,7 @@ class AppWindow(ctk.CTk):
         self.search_entry = ctk.CTkEntry(
             self.sidebar,
             textvariable=self.search_var,
-            placeholder_text="🔍 Rechercher...",
+            placeholder_text="🔍 Rechercher un pair...",
             height=36,
             corner_radius=8,
             fg_color="#E2E8F0",
@@ -86,14 +83,14 @@ class AppWindow(ctk.CTk):
         )
         self.search_entry.grid(row=1, column=0, padx=16, pady=(0, 14), sticky="ew")
 
-        # Liste scrollable des utilisateurs connectés
+        # Zone des utilisateurs connectés (ou message si vide)
         self.peers_frame = ctk.CTkScrollableFrame(
             self.sidebar, fg_color="transparent", corner_radius=0
         )
         self.peers_frame.grid(row=2, column=0, padx=6, pady=0, sticky="nsew")
         self.peers_frame.grid_columnconfigure(0, weight=1)
 
-        # Pied de profil utilisateur connecté
+        # Pied de profil utilisateur local
         footer = ctk.CTkFrame(self.sidebar, fg_color="#F1F5F9", corner_radius=0, height=68)
         footer.grid(row=3, column=0, sticky="ew")
         footer.grid_columnconfigure(1, weight=1)
@@ -134,11 +131,32 @@ class AppWindow(ctk.CTk):
         self.peer_buttons.clear()
 
         query = self.search_var.get().strip().lower()
-        row_idx = 0
-        for name, info in self.peers.items():
-            if query and query not in name.lower():
-                continue
+        filtered_peers = {
+            name: info
+            for name, info in self.peers.items()
+            if not query or query in name.lower()
+        }
 
+        # État vide dans la barre latérale si personne n'est connecté
+        if not filtered_peers:
+            empty_msg = (
+                "Aucun résultat pour cette recherche."
+                if self.peers
+                else "Aucun pair en ligne.\n\nEn attente d'appareils sur le réseau local (UDP)..."
+            )
+            empty_lbl = ctk.CTkLabel(
+                self.peers_frame,
+                text=empty_msg,
+                font=ctk.CTkFont(size=12),
+                text_color="#64748B",
+                wraplength=220,
+                justify="center",
+            )
+            empty_lbl.grid(row=0, column=0, padx=12, pady=40, sticky="ew")
+            return
+
+        colors = ["#0EA5E9", "#10B981", "#F97316", "#6366F1"]
+        for row_idx, (name, info) in enumerate(filtered_peers.items()):
             is_selected = name == self.active_peer
             bg_color = "#E2E8F0" if is_selected else "transparent"
 
@@ -148,16 +166,13 @@ class AppWindow(ctk.CTk):
             item.grid(row=row_idx, column=0, padx=4, pady=3, sticky="ew")
             item.grid_columnconfigure(1, weight=1)
 
-            # Avatar circulaire coloré
-            colors = ["#0EA5E9", "#10B981", "#F97316", "#6366F1"]
-            avatar_bg = colors[row_idx % len(colors)]
             avatar = ctk.CTkLabel(
                 item,
                 text=name[0].upper(),
                 width=34,
                 height=34,
                 corner_radius=17,
-                fg_color=avatar_bg,
+                fg_color=colors[row_idx % len(colors)],
                 text_color="#FFFFFF",
                 font=ctk.CTkFont(size=13, weight="bold"),
             )
@@ -182,7 +197,6 @@ class AppWindow(ctk.CTk):
                 w.bind("<Button-1>", lambda e, n=name: self.select_peer(n))
 
             self.peer_buttons[name] = item
-            row_idx += 1
 
     # ==========================================================
     # ZONE DE DROITE : EN-TÊTE, DISCUSSION & BARRE D'ENVOI
@@ -195,28 +209,28 @@ class AppWindow(ctk.CTk):
         self.chat_container.grid_rowconfigure(1, weight=1)
         self.chat_container.grid_columnconfigure(0, weight=1)
 
-        # En-tête du contact actif
-        header = ctk.CTkFrame(
+        # En-tête supérieur
+        self.header = ctk.CTkFrame(
             self.chat_container, fg_color="#FFFFFF", corner_radius=0, height=68
         )
-        header.grid(row=0, column=0, sticky="ew")
-        header.grid_columnconfigure(1, weight=1)
+        self.header.grid(row=0, column=0, sticky="ew")
+        self.header.grid_columnconfigure(1, weight=1)
 
         self.header_avatar = ctk.CTkLabel(
-            header,
-            text="M",
+            self.header,
+            text="?",
             width=40,
             height=40,
             corner_radius=20,
-            fg_color="#10B981",
+            fg_color="#CBD5E1",
             text_color="#FFFFFF",
             font=ctk.CTkFont(size=15, weight="bold"),
         )
         self.header_avatar.grid(row=0, column=0, rowspan=2, padx=(20, 12), pady=14)
 
         self.header_name = ctk.CTkLabel(
-            header,
-            text="Marc  ●",
+            self.header,
+            text="Aucune connexion active",
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#0F172A",
             anchor="w",
@@ -224,19 +238,18 @@ class AppWindow(ctk.CTk):
         self.header_name.grid(row=0, column=1, sticky="sw", pady=(12, 0))
 
         self.header_status = ctk.CTkLabel(
-            header,
-            text="Connecté en P2P",
+            self.header,
+            text="Hors ligne • En attente d'un destinataire",
             font=ctk.CTkFont(size=12),
             text_color="#64748B",
             anchor="w",
         )
         self.header_status.grid(row=1, column=1, sticky="nw", pady=(0, 12))
 
-        # Ligne de séparation fine
         sep_top = ctk.CTkFrame(self.chat_container, height=1, fg_color="#E2E8F0")
         sep_top.grid(row=0, column=0, sticky="sew")
 
-        # Fil des messages scrollable
+        # Zone centrale de messages
         self.messages_scroll = ctk.CTkScrollableFrame(
             self.chat_container, fg_color="#FFFFFF", corner_radius=0
         )
@@ -253,10 +266,9 @@ class AppWindow(ctk.CTk):
         sep_bot = ctk.CTkFrame(self.chat_container, height=1, fg_color="#E2E8F0")
         sep_bot.grid(row=2, column=0, sticky="new")
 
-        # Champ texte + bouton trombone intégré
         entry_wrapper = ctk.CTkFrame(
             input_bar,
-            fg_color="#FFFFFF",
+            fg_color="#F8FAFC",
             border_width=1,
             border_color="#CBD5E1",
             corner_radius=10,
@@ -267,7 +279,7 @@ class AppWindow(ctk.CTk):
 
         self.msg_entry = ctk.CTkEntry(
             entry_wrapper,
-            placeholder_text="Écrire un message...",
+            placeholder_text="Sélectionnez un utilisateur pour écrire...",
             border_width=0,
             fg_color="transparent",
             text_color="#0F172A",
@@ -276,20 +288,20 @@ class AppWindow(ctk.CTk):
         self.msg_entry.grid(row=0, column=0, padx=(10, 4), pady=4, sticky="ew")
         self.msg_entry.bind("<Return>", lambda e: self._handle_send_text())
 
-        attach_btn = ctk.CTkButton(
+        self.attach_btn = ctk.CTkButton(
             entry_wrapper,
             text="📎",
             width=32,
             height=30,
             fg_color="transparent",
-            hover_color="#F1F5F9",
+            hover_color="#E2E8F0",
             text_color="#475569",
             font=ctk.CTkFont(size=16),
             command=self._handle_attach_file,
         )
-        attach_btn.grid(row=0, column=1, padx=(0, 6), pady=4)
+        self.attach_btn.grid(row=0, column=1, padx=(0, 6), pady=4)
 
-        send_btn = ctk.CTkButton(
+        self.send_btn = ctk.CTkButton(
             input_bar,
             text="Envoyer",
             width=96,
@@ -300,17 +312,66 @@ class AppWindow(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._handle_send_text,
         )
-        send_btn.grid(row=0, column=1, padx=(0, 18), pady=12)
+        self.send_btn.grid(row=0, column=1, padx=(0, 18), pady=12)
 
     # ==========================================================
-    # RENDU DES BULLES & CARTES FICHIER SHA-256
+    # GESTION DES ÉTATS VIDES & CONVERSATIONS ACTIVES
     # ==========================================================
+    def _set_input_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        self.msg_entry.configure(
+            state=state,
+            placeholder_text="Écrire un message..."
+            if enabled
+            else "Sélectionnez un utilisateur pour écrire...",
+        )
+        self.attach_btn.configure(state=state)
+        self.send_btn.configure(state=state)
+
+    def _render_empty_chat_state(self):
+        """Affiche l'écran d'accueil vide lorsqu'aucun pair n'est sélectionné."""
+        self._set_input_enabled(False)
+        for widget in self.messages_scroll.winfo_children():
+            widget.destroy()
+
+        empty_box = ctk.CTkFrame(
+            self.messages_scroll,
+            fg_color="#F8FAFC",
+            border_width=1,
+            border_color="#E2E8F0",
+            corner_radius=14,
+        )
+        empty_box.grid(row=0, column=0, padx=60, pady=120, sticky="ew")
+
+        title = ctk.CTkLabel(
+            empty_box,
+            text="Bienvenue sur Messager LAN",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color="#0F172A",
+        )
+        title.pack(padx=24, pady=(24, 8))
+
+        desc = ctk.CTkLabel(
+            empty_box,
+            text="Aucune discussion active pour le moment.\n"
+            "Dès qu'un appareil apparaît dans la liste de gauche, cliquez dessus pour "
+            "échanger des messages instantanés ou transférer des fichiers vérifiés SHA-256.",
+            font=ctk.CTkFont(size=13),
+            text_color="#64748B",
+            wraplength=420,
+            justify="center",
+        )
+        desc.pack(padx=24, pady=(0, 24))
+
     def select_peer(self, peer_name):
+        if peer_name not in self.peers:
+            return
         self.active_peer = peer_name
         self._refresh_peer_list()
+        self._set_input_enabled(True)
 
-        info = self.peers.get(peer_name, {})
-        self.header_avatar.configure(text=peer_name[0].upper())
+        info = self.peers[peer_name]
+        self.header_avatar.configure(text=peer_name[0].upper(), fg_color="#10B981")
         self.header_name.configure(text=f"{peer_name}  ●")
         self.header_status.configure(
             text=f"Connecté en P2P ({info.get('ip', 'LAN')})"
@@ -322,6 +383,17 @@ class AppWindow(ctk.CTk):
             widget.destroy()
 
         history = self.chat_history.get(self.active_peer, [])
+        if not history:
+            no_msg = ctk.CTkLabel(
+                self.messages_scroll,
+                text=f"Début de votre échange P2P avec {self.active_peer}.\nEnvoyez un premier message ou joignez un fichier.",
+                font=ctk.CTkFont(size=13),
+                text_color="#64748B",
+                justify="center",
+            )
+            no_msg.grid(row=0, column=0, pady=140, sticky="ew")
+            return
+
         for idx, item in enumerate(history):
             if item["type"] == "text":
                 self._add_text_bubble(idx, item["text"], item["is_me"])
@@ -373,10 +445,7 @@ class AppWindow(ctk.CTk):
         card.grid_columnconfigure(1, weight=1)
 
         icon_lbl = ctk.CTkLabel(
-            card,
-            text="📄",
-            font=ctk.CTkFont(size=24),
-            text_color="#475569",
+            card, text="📄", font=ctk.CTkFont(size=24), text_color="#475569"
         )
         icon_lbl.grid(row=0, column=0, rowspan=2, padx=(14, 10), pady=(12, 4))
 
@@ -398,7 +467,6 @@ class AppWindow(ctk.CTk):
         )
         size_lbl.grid(row=1, column=1, columnspan=2, padx=(0, 14), pady=(0, 6), sticky="w")
 
-        # Barre de progression verte
         bar = ctk.CTkProgressBar(
             card,
             width=250,
@@ -418,8 +486,11 @@ class AppWindow(ctk.CTk):
         )
         pct_lbl.grid(row=2, column=2, padx=(0, 14), pady=4)
 
-        # Badge Vérifié SHA-256
-        badge_text = "✔  Transfert réussi • Vérifié SHA-256" if verified else "⏳ Transfert en cours..."
+        badge_text = (
+            "✔  Transfert réussi • Vérifié SHA-256"
+            if verified
+            else "⏳ Transfert en cours..."
+        )
         badge_color = "#10B981" if verified else "#64748B"
         badge = ctk.CTkLabel(
             card,
@@ -431,9 +502,11 @@ class AppWindow(ctk.CTk):
         badge.grid(row=3, column=0, columnspan=3, padx=14, pady=(2, 12), sticky="w")
 
     # ==========================================================
-    # ACTIONS UTILISATEUR & MÉTHODES PUBLIQUES POUR L'INTÉGRATION
+    # MÉTHODES PUBLIQUES POUR L'INTÉGRATION RÉSEAU
     # ==========================================================
     def _handle_send_text(self):
+        if not self.active_peer:
+            return
         text = self.msg_entry.get().strip()
         if not text:
             return
@@ -445,13 +518,20 @@ class AppWindow(ctk.CTk):
             self.on_send_message(target_ip, self.active_peer, text)
 
     def _handle_attach_file(self):
+        if not self.active_peer:
+            return
         file_path = filedialog.askopenfilename(title="Choisir un fichier à envoyer")
         if not file_path:
             return
         filename = os.path.basename(file_path)
         size_kb = max(0.1, os.path.getsize(file_path) / 1024)
         self.append_file(
-            self.active_peer, filename, f"{size_kb:.1f} KB", progress=1.0, verified=True, is_me=True
+            self.active_peer,
+            filename,
+            f"{size_kb:.1f} KB",
+            progress=1.0,
+            verified=True,
+            is_me=True,
         )
 
         if self.on_send_file:
@@ -465,7 +545,9 @@ class AppWindow(ctk.CTk):
         if peer_name == self.active_peer:
             self._render_messages()
 
-    def append_file(self, peer_name, filename, size_str, progress=1.0, verified=True, is_me=False):
+    def append_file(
+        self, peer_name, filename, size_str, progress=1.0, verified=True, is_me=False
+    ):
         self.chat_history.setdefault(peer_name, []).append(
             {
                 "type": "file",
@@ -480,33 +562,22 @@ class AppWindow(ctk.CTk):
             self._render_messages()
 
     def update_online_peers(self, peers_dict):
-        """Appelée par core/discovery.py pour rafraîchir la liste des pairs."""
-        for name, ip in peers_dict.items():
-            self.peers[name] = {"ip": ip, "online": True}
+        """Appelée par core/discovery.py pour mettre à jour la liste des pairs."""
+        self.peers = {
+            name: {"ip": ip, "online": True} for name, ip in peers_dict.items()
+        }
+        for name in self.peers:
             self.chat_history.setdefault(name, [])
-        self._refresh_peer_list()
 
-    def _load_demo_conversation(self):
-        self.chat_history["Marc"] = [
-            {
-                "type": "text",
-                "text": "Salut Grégoire, tu as pu avancer sur le module de transport TCP ?",
-                "is_me": False,
-            },
-            {
-                "type": "text",
-                "text": "Oui ! J'ai terminé l'encapsulation Big-Endian dans core/transport.py. Je t'envoie le fichier pour test.",
-                "is_me": True,
-            },
-            {
-                "type": "file",
-                "filename": "core/transport.py",
-                "size_str": "4.2 KB",
-                "progress": 1.0,
-                "verified": True,
-                "is_me": False,
-            },
-        ]
+        # Si le pair actif s'est déconnecté, repasser à l'état vide
+        if self.active_peer and self.active_peer not in self.peers:
+            self.active_peer = None
+            self.header_avatar.configure(text="?", fg_color="#CBD5E1")
+            self.header_name.configure(text="Aucune connexion active")
+            self.header_status.configure(text="Hors ligne • En attente d'un destinataire")
+            self._render_empty_chat_state()
+
+        self._refresh_peer_list()
 
 
 if __name__ == "__main__":
